@@ -1,0 +1,82 @@
+name: LSF provenance wrapper source owner
+on:
+  push:
+    branches:
+      - diag/20261105-attest-wrapper-owner
+permissions:
+  contents: read
+jobs:
+  source-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      SOURCE_COMMIT: b01d99f97fc67eb9a250c06f57087cb1c967e777
+      SOURCE_TREE: 9dff91ae9cff4548b3d6a5c5f614c0eb2a4786ba
+      BASE_COMMIT: 16b356100dfe77222eebe783b5e26a565b76055a
+      CHILD_COMMIT: ac3d77bef0ab118e8a29decb53e9f03622ee7299
+      CHILD_TREE: 02f94d909cefa3fa466bbfa696f25c0e5626a3eb
+      EVIDENCE: /tmp/lsf-attest-wrapper-evidence
+    steps:
+      - uses: KirilsTurkins/lsf-checkout@4d310727149d3abacc52b5dcb0a1c4d18b345d13
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - name: Authenticate wrapper source and only child-pin change
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_COMMIT"
+          test "$(git rev-parse "${SOURCE_COMMIT}^{tree}")" = "$SOURCE_TREE"
+          test "$(git rev-parse "${SOURCE_COMMIT}^")" = "$BASE_COMMIT"
+          test "$(git diff --name-only "$SOURCE_COMMIT" HEAD)" = .github/workflows/lsf-attest-wrapper-owner.yml
+          test "$(git diff --name-only "$BASE_COMMIT" "$SOURCE_COMMIT")" = action.yml
+          git show "${BASE_COMMIT}:action.yml" > "$EVIDENCE/action-before.yml"
+          git show "${SOURCE_COMMIT}:action.yml" > "$EVIDENCE/action-after.yml"
+          python3 - <<'PY'
+          from pathlib import Path
+          before = Path('/tmp/lsf-attest-wrapper-evidence/action-before.yml').read_bytes()
+          after = Path('/tmp/lsf-attest-wrapper-evidence/action-after.yml').read_bytes()
+          old = b'KirilsTurkins/lsf-attest@5c5af1d743b681abf5f53d906d2bcbbcb6da5ba2'
+          new = b'KirilsTurkins/lsf-attest@ac3d77bef0ab118e8a29decb53e9f03622ee7299'
+          assert before.count(old) == 1 and before.replace(old, new) == after
+          PY
+          git rev-parse HEAD "$SOURCE_COMMIT" "${SOURCE_COMMIT}^{tree}" "$BASE_COMMIT" > "$EVIDENCE/source-identities.txt"
+      - name: Authenticate the consumed child and its committed runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          child="$RUNNER_TEMP/lsf-attest-child.git"
+          git init --bare -q "$child"
+          git --git-dir="$child" fetch --quiet --no-tags --depth=1 https://github.com/KirilsTurkins/lsf-attest.git "$CHILD_COMMIT"
+          test "$(git --git-dir="$child" rev-parse FETCH_HEAD)" = "$CHILD_COMMIT"
+          test "$(git --git-dir="$child" rev-parse 'FETCH_HEAD^{tree}')" = "$CHILD_TREE"
+          mkdir -p "$EVIDENCE/child-dist"
+          for file in index.js 50.index.js 606.index.js licenses.txt package.json; do
+            git --git-dir="$child" show "FETCH_HEAD:dist/$file" > "$EVIDENCE/child-dist/$file"
+          done
+          (cd "$EVIDENCE/child-dist" && sha256sum *) > "$EVIDENCE/child-dist-sha256.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          root = Path('/tmp/lsf-attest-wrapper-evidence/child-dist')
+          expected = {
+            'index.js': '0c611191565244227631683833b64bf878751c59b8527c254daceeed43096052',
+            '50.index.js': '45195f12661aeef8aa7ffabfd780d02fffd45c2c37102ff2ecf217a56d6d4f92',
+            '606.index.js': '629225cc3e937e22ce6b90c21f1d938d1be0716257446593555696bf1d01523e',
+            'licenses.txt': 'ecaaf3e9799bcf31db16d25584213e1ef190a364d561a82164a5abc5b1327835',
+            'package.json': '3ca9d4afd21425087cf31893b8f9f63c81b0b8408db5e343ca76e5f8aa26ab9a',
+          }
+          assert {p.name for p in root.iterdir()} == set(expected)
+          assert all(hashlib.sha256((root / name).read_bytes()).hexdigest() == digest for name, digest in expected.items())
+          PY
+          git --git-dir="$child" rev-parse FETCH_HEAD 'FETCH_HEAD^{tree}' > "$EVIDENCE/child-identities.txt"
+          (cd "$EVIDENCE" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: KirilsTurkins/lsf-upload-artifact@d74a697ce553b389f4219545e07c97fb8542c64f
+        with:
+          name: lsf-attest-wrapper-evidence
+          path: /tmp/lsf-attest-wrapper-evidence
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
